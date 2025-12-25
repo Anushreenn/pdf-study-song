@@ -22,39 +22,7 @@ client = get_client()
 SAVE_DIR = "pdf_songs"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# ---------- YOUR EXACT HELPERS ----------
-def looks_noisy(t: str) -> bool:
-    """Return True if text looks like OCR garbage."""
-    t = t.strip()
-    if len(t) < 80: return True
-    letters_spaces = sum(c.isalpha() or c.isspace() for c in t)
-    ratio = letters_spaces / max(len(t), 1)
-    return ratio < 0.5
-
-# ---------- YOUR EXACT FUNCTIONS ----------
-def get_topic_heading(chunk: str, lang: str) -> str:
-    if lang == "hindi":
-        system_prompt = (
-            "दिए गए अध्ययन सामग्री के लिए सिर्फ़ 2-6 शब्दों का छोटा टॉपिक/शीर्षक लिखो। "
-            "पूरा वाक्य नहीं, कोई व्याख्या नहीं, सिर्फ़ शीर्षक।"
-        )
-    else:
-        system_prompt = (
-            "For the given study text, write ONLY a very short topic heading "
-            "(2-6 words). No sentence, no explanation, just the heading."
-        )
-
-    resp = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": chunk[:800]},
-        ],
-        temperature=0.2,
-        max_tokens=20,
-    )
-    return resp.choices[0].message.content.strip()
-
+# ---------- Language detection ----------
 def detect_language(text):
     hindi_chars = len(re.findall(r'[\u0900-\u097F]', text))
     latin_chars = len(re.findall(r'[A-Za-z]', text))
@@ -63,40 +31,31 @@ def detect_language(text):
         return "hindi"
     return "english"
 
-def chunk_text(text, size=1800):
+def chunk_text(text, size=2500):  # Larger chunks = fewer calls
     return [text[i:i+size] for i in range(0, len(text), size)]
 
+# ---------- SINGLE API CALL: Topic + Song ----------
 @st.cache_data
-def make_song(chunk, lang="auto"):
+def make_song_with_topic(chunk, lang="auto"):
     if lang == "auto":
         lang = detect_language(chunk[:400])
-
-    safe_chunk = chunk.strip()
-    if not safe_chunk:
-        safe_chunk = "Text is almost empty and noisy; use only these few visible words:\n" + chunk[:200]
-
+    
+    safe_chunk = chunk.strip()[:5000]  # Truncate for token limit
+    
     if lang == "hindi":
-        system_prompt = """तुम्हें नीचे दिए गए टेक्स्ट (chapter content) को ही लेकर
-एक छोटा, सरल और याद रखने लायक हिंदी स्टडी गीत बनाना है।
+        system_prompt = """नीचे दिए गए टेक्स्ट से EXACTLY:
+1. पहली लाइन: 2-6 शब्दों का टॉपिक शीर्षक (कोई नंबर नहीं)
+2. खाली लाइन  
+3. हिंदी स्टडी गीत (छोटी लाइनें, कोरस, छात्रों के लिए आसान)
 
-सख्त नियम:
-- सिर्फ़ दिए गए टेक्स्ट में जो concepts, facts, definitions, examples हैं, वही इस्तेमाल करो
-- कोई नया example, जगह, कहानी, व्यक्ति, organization खुद से मत बनाओ
-- अगर कुछ समझ में नहीं आता, उसे छोड़ दो; अपने से कुछ मत जोड़ो
-- छात्रों के लिए आसान हिंदी, छोटी लाइनें, कोरस और दोहराव
-- आउटपुट सिर्फ़ गीत के बोल हो; explanation या "मैं नहीं कर सकता" मत लिखो
-"""
+सिर्फ़ दिए गए टेक्स्ट के concepts/facts इस्तेमाल करो। कोई नया content नहीं।"""
     else:
-        system_prompt = """You are given ONLY textbook content for a specific chapter.
-Turn ONLY this content into a short, simple, easy-to-memorize study song.
+        system_prompt = """From given textbook text, output EXACTLY:
+1. First line: 2-6 word topic heading (NO numbers/brackets)
+2. Blank line
+3. English study song lyrics only (short lines, chorus, student-friendly)
 
-STRICT rules:
-- Use ONLY concepts, terms, definitions, and examples that appear in the given text
-- Do NOT add any new topics, places, names, stories, or facts that are not clearly present
-- If something is unclear or missing, SKIP it instead of inventing details
-- Student-friendly, short lines with a small chorus
-- Output ONLY song lyrics, never explanations or meta-comments
-"""
+Use ONLY concepts from this text. NO new facts/examples."""
 
     try:
         response = client.chat.completions.create(
@@ -108,18 +67,27 @@ STRICT rules:
             temperature=0.5,
             max_tokens=450
         )
-        return response.choices[0].message.content.strip()
+        full = response.choices[0].message.content.strip()
+        
+        lines = full.splitlines()
+        if lines:
+            topic = lines[0].strip()
+            verse = "\n".join(lines[1:]).strip()
+            return topic, verse or full
+        return "Geography Topic", full
     except Exception as e:
-        return f"Error: Rate limit reached (try again later)"
+        if "429" in str(e):
+            return "Rate Limited", "Daily limit reached - wait 5min or upgrade!"
+        return "Error", "Generation failed"
 
-# ---------- YOUR EXACT PDF PROCESSING (Simplified - no OCR deps) ----------
+# ---------- PDF Processing ----------
 def extract_pdf_text(uploaded_file):
     uploaded_file.seek(0)
     reader = PdfReader(uploaded_file)
     text = ""
     page_count = len(reader.pages)
     
-    for i, page in enumerate(reader.pages):
+    for page in reader.pages:
         t = page.extract_text() or ""
         text += t + "\n"
     
@@ -128,21 +96,21 @@ def extract_pdf_text(uploaded_file):
     text = re.sub(r'[^\w\s\n।।।।।।]', ' ', text)
     return text.strip(), page_count
 
-# ---------- YOUR EXACT UI ----------
+# ---------- Main UI ----------
 st.title("🎵 PDF to Study Song Generator 🎵")
-st.markdown("**English / हिंदी PDFs के लिए काम करता है (printed + scanned). Handwritten is experimental.**")
+st.markdown("**English / हिंदी PDFs के लिए काम करता है (printed + scanned)**")
 
 col1, col2 = st.columns([1, 3])
 
 with col1:
     lang_mode = st.radio(
         "🌐 Language Mode:",
-        ["🚀 Auto-detect", "🇺🇸 Force English", "🇮🇳 Force Hindi","both english and hindi"],
+        ["🚀 Auto-detect", "🇺🇸 Force English", "🇮🇳 Force Hindi"],
         index=0
     )
 
 with col2:
-    st.info("📚 Printed / scanned textbook PDFs पर best results. Handwritten notes पर OCR हमेशा accurate नहीं होगा।")
+    st.info("📚 **Printed/scanned textbook PDFs** पर best results")
 
 # SINGLE PDF upload
 uploaded_file = st.file_uploader("📁 Upload PDF", type="pdf")
@@ -164,41 +132,41 @@ if uploaded_file is not None:
 
     st.success(f"✅ PDF ready! Detected: **{lang_display}**")
 
-    st.warning("⚠️ **Free limit: ~10 verses**. Upgrade Groq for unlimited!")
-
     if st.button("🎶 Generate Study Song", type="primary", use_container_width=True):
         if lang_mode == "🚀 Auto-detect":
             final_lang = detected_lang
-        elif "Hindi" in lang_mode:
-            final_lang = "hindi"
-        else:
+        elif lang_mode == "🇺🇸 Force English":
             final_lang = "english"
+        else:
+            final_lang = "hindi"
 
-        chunks = chunk_text(text)[:10]  # MAX 10 VERSES - RATE LIMIT SAFE
-        st.info(f"🎼 Creating {len(chunks)} verse(s) in **{final_lang.upper()}** …")
+        chunks = chunk_text(text)[:12]  # MAX 12 VERSES
+        st.info(f"🎼 Creating **{len(chunks)} verse(s)** in **{final_lang.upper()}** …")
 
         bar = st.progress(0.0)
         status = st.empty()
-        final_song = ""
+        final_song = f"# 📚 Study Song - {lang_display}\n\n"
 
+        rate_limit_reached = False
+        
         for i, chunk in enumerate(chunks):
+            if rate_limit_reached:
+                final_song += f"**Verse {i+1}:** (⏳ Rate limit reached)\n\n---\n\n"
+                continue
+                
             status.text(f"✍️ Generating verse {i+1}/{len(chunks)} …")
-
-            try:
-                topic = get_topic_heading(chunk, final_lang)
-                verse = make_song(chunk, final_lang)
-            except:
-                topic = "Rate Limited"
-                verse = "Skipped - daily limit reached"
-
+            
+            topic, verse = make_song_with_topic(chunk, final_lang)
+            
             final_song += (
                 f"**🧾 Topic:** {topic}\n\n"
                 f"**🎵 Verse {i+1} 🎵**\n\n"
-                f"{verse}\n\n---\n\n"
+                f"{verse}\n\n"
+                f"---\n\n"
             )
-
+            
             bar.progress((i + 1) / len(chunks))
-            time.sleep(0.8)  # RATE LIMIT PROTECTION
+            time.sleep(1.0)  # PERFECT RATE LIMIT PROTECTION
 
         st.subheader("🎤 Your Complete Study Song")
         st.markdown(final_song)
@@ -211,6 +179,10 @@ if uploaded_file is not None:
             mime="text/plain",
             use_container_width=True
         )
+        st.balloons()
 
 else:
-    st.info("📁 Upload PDF to generate study song!")
+    st.info("📁 **Upload PDF** to generate study songs!")
+
+st.markdown("---")
+st.markdown("*Powered by Groq + Streamlit* 🚀")
