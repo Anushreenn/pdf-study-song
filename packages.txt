@@ -1,4 +1,7 @@
-tesseract-ocr
-tesseract-ocr-eng
-tesseract-ocr-hin
+streamlit
+groq
+pypdf
+pdf2image
+pytesseract
+Pillow
 poppler-utils
