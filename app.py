@@ -1,175 +1,143 @@
 # app.py
 import streamlit as st
-import os
+import os, time, re
 from pypdf import PdfReader
 from groq import Groq
-import time, re, random
-
 from pdf2image import convert_from_path
 from PIL import Image
 import pytesseract
 
-# ---------------------------
-# SAFE SAVE DIR
-# ---------------------------
+# ------------------------------------------------
+# 🔐 GROQ API - from Streamlit Secrets (Cloud Safe)
+# ------------------------------------------------
+client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+
 SAVE_DIR = "pdf_songs"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# ---------------------------
-# 🔐 API KEY
-# ---------------------------
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
-# ---------------------------
-# RETRY (ANTI-RATE LIMIT)
-# ---------------------------
-def safe_groq_call(messages, max_tokens=250, tries=4):
-    """Retry request if GROQ gives rate limit error."""
-    for attempt in range(tries):
+# ------------------------------------------------
+# 🛡️ Rate Limit Safe Call
+# ------------------------------------------------
+def safe_groq(messages, max_tokens=400):
+    for a in range(4):
         try:
-            response = client.chat.completions.create(
+            r = client.chat.completions.create(
                 model="llama-3.1-8b-instant",
+                temperature=0.4,
                 messages=messages,
-                temperature=0.5,
                 max_tokens=max_tokens,
             )
-            return response.choices[0].message.content.strip()
-
+            return r.choices[0].message.content.strip()
         except Exception as e:
-            if "rate" in str(e).lower() or "limit" in str(e).lower():
-                wait = 2 * (attempt + 1)  # exponential backoff
-                st.warning(f"⏳ GROQ Rate limit! retrying in {wait}s...")
-                time.sleep(wait)
+            if "rate" in str(e).lower():
+                t = 2 * (a + 1)
+                st.warning(f"⏳ Groq Rate Limit. Retrying in {t}s...")
+                time.sleep(t)
                 continue
-            return f"⚠️ Error: {e}"
-    return "❌ Rate limit reached repeatedly. Try again in 1-2 minutes."
+            return f"❌ Error: {e}"
+    return "❌ Server busy. Try again later."
 
-# ---------- SONG TOPIC ----------
-def get_topic_heading(chunk, lang):
-    if lang == "hindi":
-        system = "दिए गए टेक्स्ट के लिए सिर्फ़ 2-6 शब्दों का छोटा विषय शीर्षक लिखो।"
-    else:
-        system = "Write ONLY a 2-6 word short heading from the text."
+# ------------------------------------------------
+# 🔤 Language Detection
+# ------------------------------------------------
+def detect_lang(text):
+    hi = len(re.findall(r'[\u0900-\u097F]', text))
+    en = len(re.findall(r'[A-Za-z]', text))
+    return "hindi" if hi > en else "english"
 
-    messages = [
-        {"role":"system","content":system},
-        {"role":"user","content":chunk[:800]}
+# ------------------------------------------------
+# 📄 Split Text
+# ------------------------------------------------
+def chunk_text(t, n=1800):
+    return [t[i:i+n] for i in range(0, len(t), n)]
+
+# ------------------------------------------------
+# 🎵 Topic Title
+# ------------------------------------------------
+def topic(chunk, lang):
+    sys = "2-5 words heading" if lang == "english" else "2-5 शब्द का शीर्षक"
+    msgs = [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": chunk[:600]}
     ]
-    return safe_groq_call(messages, max_tokens=30)
+    return safe_groq(msgs, 30)
 
-# ---------- LANGUAGE DETECT ----------
-def detect_language(text):
-    hindi_chars = len(re.findall(r'[\u0900-\u097F]', text))
-    latin_chars = len(re.findall(r'[A-Za-z]', text))
-    total = len(text) or 1
-    return "hindi" if (hindi_chars/total > 0.05 and hindi_chars > latin_chars) else "english"
-
-# ---------- SPLIT PDF TEXT ----------
-def chunk_text(text, size=1700):
-    return [text[i:i+size] for i in range(0, len(text), size)]
-
-# ---------- SONG MAKER ----------
-def make_song(chunk, lang="auto"):
-    if lang == "auto":
-        lang = detect_language(chunk[:500])
-
+# ------------------------------------------------
+# 🎶 Song Generation
+# ------------------------------------------------
+def make_song(chunk, lang):
     if lang == "hindi":
-        system = """
-ONLY use given Hindi text to make a study song.
-Short lines, rhyming simple.
-Make 6–10 lines + 1 chorus. No new facts.
-"""
+        sys = "ONLY use Hindi text to make a simple study song. No new info."
     else:
-        system = """
-ONLY use given English textbook content to make a study song.
-Simple, rhyming, student-friendly, 6–10 lines + chorus.
-No extra information.
-"""
-
-    messages = [
-        {"role":"system","content":system},
-        {"role":"user","content":chunk}
+        sys = "ONLY use English text to make a simple study song. No new info."
+    
+    msgs = [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": chunk}
     ]
-    return safe_groq_call(messages, max_tokens=450)
+    return safe_groq(msgs, 450)
 
-# ----------------------------------------------------------------
-# 🎨 UI
-# ----------------------------------------------------------------
+# ------------------------------------------------
+# UI
+# ------------------------------------------------
 st.set_page_config(page_title="PDF Study Song Generator", layout="wide")
-st.title("🎵 PDF to Study Song Generator (Hindi/English + OCR)")
-st.caption("📄 Scanned PDFs supported (OCR). No API key shown.")
+st.title("🎵 PDF → Study Song Generator")
+st.caption("📄 Works for scanned and normal PDFs (OCR).")
 
-lang_mode = st.radio(
-    "Language Mode:",
-    ["🚀 Auto-detect", "🇺🇸 Force English", "🇮🇳 Force Hindi"],
-    index=0
-)
+mode = st.radio("Language Mode:", ["Auto", "English", "Hindi"], horizontal=True)
+file = st.file_uploader("📁 Upload PDF", type="pdf")
 
-uploaded_file = st.file_uploader("📁 Upload PDF", type="pdf")
+if file:
+    name = file.name
+    with open(name, "wb") as f: f.write(file.read())
 
-# ----------------------------------------------------------------
-# 📥 Process PDF
-# ----------------------------------------------------------------
-if uploaded_file:
-    tmp_pdf_path = uploaded_file.name
-    with open(tmp_pdf_path, "wb") as f:
-        f.write(uploaded_file.read())
+    st.info("🔍 Reading PDF + OCR if needed...")
+    
+    reader = PdfReader(name)
+    full_text = ""
+    bad = 0
+    pb = st.progress(0)
 
-    with st.spinner("🔍 Extracting text & running OCR..."):
-        reader = PdfReader(tmp_pdf_path)
-        text = ""
-        progress = st.progress(0)
-        page_count = len(reader.pages)
+    for i, p in enumerate(reader.pages):
+        txt = (p.extract_text() or "").strip()
 
-        for i, page in enumerate(reader.pages):
-            raw = (page.extract_text() or "").strip()
+        # 🧠 OCR if no text
+        if len(txt) < 40:
+            try:
+                img = convert_from_path(name, dpi=300, first_page=i+1, last_page=i+1)[0]
+                txt = pytesseract.image_to_string(img, lang="hin+eng")
+            except:
+                txt = ""
+        if len(txt) < 20: bad += 1
 
-            # If not enough text → OCR
-            if len(raw) < 25:
-                img = convert_from_path(tmp_pdf_path, dpi=300, first_page=i+1, last_page=i+1)[0]
-                raw = pytesseract.image_to_string(img, lang="hin+eng")
+        full_text += txt + "\n"
+        pb.progress((i+1)/len(reader.pages))
 
-            text += raw + "\n"
-            progress.progress((i+1)/page_count)
+    auto = detect_lang(full_text[:1500])
+    final = "english" if mode=="English" else "hindi" if mode=="Hindi" else auto
+    st.success(f"🎯 Detected: {auto.upper()} → Output: {final.upper()}")
 
-    # Decide language
-    detected = detect_language(text[:2000])
-    final_lang = detected if lang_mode == "🚀 Auto-detect" else ("hindi" if "Hindi" in lang_mode else "english")
+    if bad:
+        st.warning(f"⚠️ {bad} page(s) unreadable / handwritten")
 
-    st.success(f"🎯 Detected: {detected.upper()} → Output: {final_lang.upper()}")
-
-    # ----------------------------------------------------------------
-    # 🎶 Generate Song
-    # ----------------------------------------------------------------
-    if st.button("🎶 Generate Song", type="primary"):
-        chunks = chunk_text(text)
-        st.info(f"✍️ Making {len(chunks)} verse(s)...")
-
+    if st.button("🎶 Generate Song"):
+        parts = chunk_text(full_text)
+        st.info(f"✍️ Making {len(parts)} verse(s)...")
         bar = st.progress(0)
-        final_song = ""
+        out = ""
 
-        for i, chunk in enumerate(chunks):
-            topic = get_topic_heading(chunk, final_lang)
-            verse = make_song(chunk, final_lang)
+        for i, c in enumerate(parts):
+            t = topic(c, final)
+            s = make_song(c, final)
+            out += f"## {t}\n🎵 Verse {i+1}\n\n{s}\n\n---\n\n"
+            bar.progress((i+1)/len(parts))
 
-            final_song += f"## 🧾 {topic}\n\n🎵 **Verse {i+1}**\n{verse}\n\n---\n\n"
-            bar.progress((i + 1) / len(chunks))
+        st.subheader("🎤 Final Song")
+        st.markdown(out)
 
-        st.subheader("✨ Final Song")
-        st.markdown(final_song)
-
-        # Save + download
-        fn = uploaded_file.name.replace(".pdf", f"_{final_lang}_song.txt")
+        fn = name.replace(".pdf", f"_{final}.txt")
         with open(os.path.join(SAVE_DIR, fn), "w", encoding="utf-8") as f:
-            f.write(final_song)
+            f.write(out)
 
-        st.download_button(
-            "📥 Download Song",
-            data=final_song,
-            file_name=fn,
-            mime="text/plain",
-            use_container_width=True
-        )
-
+        st.download_button("📥 Download Song", out, fn)
         st.balloons()
-        st.success("🚀 Done! Your Study Song is Ready 🎤")
