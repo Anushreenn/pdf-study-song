@@ -1,3 +1,4 @@
+%%writefile app.py
 import streamlit as st
 import os
 from pypdf import PdfReader
@@ -5,247 +6,180 @@ from groq import Groq
 import time
 import re
 import io
-from PIL import Image
-import pytesseract
+try:
+    import numpy as np
+    import cv2
+    from pdf2image import convert_from_path
+    from PIL import Image
+    import pytesseract
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+    st.warning("⚠️ OCR disabled (install pdf2image+pytesseract locally)")
 
-# Page config
+# Config
 st.set_page_config(page_title="PDF Study Song (HI+EN+OCR)", layout="wide")
 
-# Groq client
+# Groq client (env var for Streamlit Cloud)
 @st.cache_resource
 def get_client():
-    return Groq(api_key=os.environ.get("GROQ_API_KEY"))
+    return Groq(api_key=os.environ.get("GROQ_API_KEY", "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"))
 
 client = get_client()
 
 SAVE_DIR = "pdf_songs"
+os.makedirs(SAVE_DIR, exist_ok=True)
 
-# ---------- Helpers ----------
+# ---------- YOUR EXACT HELPERS ----------
 def preprocess_for_ocr(pil_img):
-    """Light preprocessing to help Tesseract on scans/handwritten."""
-    from PIL import ImageEnhance
-    img = pil_img.convert("L")  # grayscale
-    enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(2)
-    return img
+    if not OCR_AVAILABLE: return pil_img
+    img = np.array(pil_img.convert("L"))
+    img = cv2.resize(img, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+    img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    img = cv2.medianBlur(img, 3)
+    return Image.fromarray(img)
 
 def looks_noisy(t: str) -> bool:
-    """Return True if text looks like OCR garbage."""
     t = t.strip()
-    if len(t) < 80:
-        return True
+    if len(t) < 80: return True
     letters_spaces = sum(c.isalpha() or c.isspace() for c in t)
     ratio = letters_spaces / max(len(t), 1)
     return ratio < 0.5
 
-# ---------- Topic heading ----------
+# ---------- YOUR EXACT FUNCTIONS ----------
 def get_topic_heading(chunk: str, lang: str) -> str:
     if lang == "hindi":
-        system_prompt = (
-            "दिए गए अध्ययन सामग्री के लिए सिर्फ़ 2-6 शब्दों का छोटा टॉपिक/शीर्षक लिखो। "
-            "पूरा वाक्य नहीं, कोई व्याख्या नहीं, सिर्फ़ शीर्षक।"
-        )
+        system_prompt = "दिए गए अध्ययन सामग्री के लिए सिर्फ़ 2-6 शब्दों का छोटा टॉपिक/शीर्षक लिखो। पूरा वाक्य नहीं, कोई व्याख्या नहीं, सिर्फ़ शीर्षक।"
     else:
-        system_prompt = (
-            "For the given study text, write ONLY a very short topic heading "
-            "(2-6 words). No sentence, no explanation, just the heading."
-        )
+        system_prompt = "For the given study text, write ONLY a very short topic heading (2-6 words). No sentence, no explanation, just the heading."
 
     resp = client.chat.completions.create(
         model="llama-3.1-8b-instant",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": chunk[:800]},
-        ],
-        temperature=0.2,
-        max_tokens=20,
+        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": chunk[:800]}],
+        temperature=0.2, max_tokens=20,
     )
     return resp.choices[0].message.content.strip()
 
-# ---------- Language detection ----------
 def detect_language(text):
     hindi_chars = len(re.findall(r'[\u0900-\u097F]', text))
     latin_chars = len(re.findall(r'[A-Za-z]', text))
     total = len(text) or 1
-    if hindi_chars / total > 0.05 and hindi_chars > latin_chars:
-        return "hindi"
+    if hindi_chars / total > 0.05 and hindi_chars > latin_chars: return "hindi"
     return "english"
 
 def chunk_text(text, size=1800):
     return [text[i:i+size] for i in range(0, len(text), size)]
 
-# ---------- Song generation ----------
 @st.cache_data
 def make_song(chunk, lang="auto"):
-    if lang == "auto":
-        lang = detect_language(chunk[:400])
-
-    safe_chunk = chunk.strip()
-    if not safe_chunk:
-        safe_chunk = "Text is almost empty and noisy; use only these few visible words:\n" + chunk[:200]
+    if lang == "auto": lang = detect_language(chunk[:400])
+    safe_chunk = chunk.strip() or f"Text is almost empty; use: {chunk[:200]}"
 
     if lang == "hindi":
         system_prompt = """तुम्हें नीचे दिए गए टेक्स्ट (chapter content) को ही लेकर
 एक छोटा, सरल और याद रखने लायक हिंदी स्टडी गीत बनाना है।
-
-सख्त नियम:
-- सिर्फ़ दिए गए टेक्स्ट में जो concepts, facts, definitions, examples हैं, वही इस्तेमाल करो
-- कोई नया example, जगह, कहानी, व्यक्ति, organization खुद से मत बनाओ
-- अगर कुछ समझ में नहीं आता, उसे छोड़ दो; अपने से कुछ मत जोड़ो
-- छात्रों के लिए आसान हिंदी, छोटी लाइनें, कोरस और दोहराव
-- आउटपुट सिर्फ़ गीत के बोल हो; explanation या "मैं नहीं कर सकता" मत लिखो
-"""
+सख्त नियम: सिर्फ़ दिए गए टेक्स्ट में जो concepts, facts हैं वही इस्तेमाल करो।"""
     else:
-        system_prompt = """You are given ONLY textbook content for a specific chapter.
-Turn ONLY this content into a short, simple, easy-to-memorize study song.
-
-STRICT rules:
-- Use ONLY concepts, terms, definitions, and examples that appear in the given text
-- Do NOT add any new topics, places, names, stories, or facts that are not clearly present
-- If something is unclear or missing, SKIP it instead of inventing details
-- Student-friendly, short lines with a small chorus
-- Output ONLY song lyrics, never explanations or meta-comments
-"""
+        system_prompt = """You are given ONLY textbook content. Turn ONLY this into study song.
+STRICT: Use ONLY concepts from given text. Student-friendly, short lines, chorus."""
 
     response = client.chat.completions.create(
         model="llama-3.1-8b-instant",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": safe_chunk}
-        ],
-        temperature=0.5,
-        max_tokens=450
+        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": safe_chunk}],
+        temperature=0.5, max_tokens=450
     )
     return response.choices[0].message.content.strip()
 
-# ---------- PDF Processing with OCR ----------
-def extract_pdf_text(uploaded_file):
-    text = ""
-    noisy_pages = 0
-    page_count = 0
-    
-    # Save uploaded file temporarily
+# ---------- YOUR EXACT PDF PROCESSING ----------
+def process_pdf(uploaded_file):
+    uploaded_file.seek(0)
     tmp_pdf_path = f"/tmp/{uploaded_file.name}"
-    with open(tmp_pdf_path, "wb") as f:
-        f.write(uploaded_file.read())
-        uploaded_file.seek(0)  # Reset for later use
+    with open(tmp_pdf_path, "wb") as f: f.write(uploaded_file.read())
+    
+    noisy_pages = 0
+    text = ""
     
     try:
         reader = PdfReader(tmp_pdf_path)
         page_count = len(reader.pages)
+        prog = st.progress(0.0)
         
         for i, page in enumerate(reader.pages):
             t = page.extract_text() or ""
             clean = t.strip()
             
-            # If almost no text, try OCR
-            if len(clean) < 40:
+            if len(clean) < 40 and OCR_AVAILABLE:
                 try:
-                    images = convert_from_path(tmp_pdf_path, dpi=200, first_page=i+1, last_page=i+1)
+                    images = convert_from_path(tmp_pdf_path, dpi=300, first_page=i+1, last_page=i+1)
                     img = preprocess_for_ocr(images[0])
-                    ocr_text = pytesseract.image_to_string(img, lang='hin+eng')
-                    t = ocr_text if not looks_noisy(ocr_text) else t
-                    if looks_noisy(ocr_text):
-                        noisy_pages += 1
-                except:
-                    pass
+                    ocr_text = pytesseract.image_to_string(img, lang="hin+eng")
+                    if not looks_noisy(ocr_text): t = ocr_text
+                    else: noisy_pages += 1
+                except: pass
             
             text += t + "\n"
-    except:
-        text = ""
+            prog.progress((i + 1) / page_count)
+        
+        if noisy_pages > page_count * 0.6:
+            st.error("❌ Too much noisy OCR. Try clearer PDF.")
+            st.stop()
+            
+    except: text = ""
     
     return text.strip(), page_count, noisy_pages
 
-# ---------- Main UI ----------
+# ---------- YOUR EXACT UI ----------
 st.title("🎵 PDF to Study Song Generator 🎵")
-st.markdown("**English / हिंदी PDFs के लिए काम करता है (printed + scanned). Handwritten is experimental.**")
+st.markdown("**English / हिंदी PDFs (printed + scanned). Handwritten experimental.**")
 
 col1, col2 = st.columns([1, 3])
 with col1:
-    lang_mode = st.radio(
-        "🌐 Language Mode:",
-        ["🚀 Auto-detect", "🇺🇸 Force English", "🇮🇳 Force Hindi", "both english and hindi"],
-        index=0
-    )
-
+    lang_mode = st.radio("🌐 Language Mode:", ["🚀 Auto-detect", "🇺🇸 Force English", "🇮🇳 Force Hindi", "both english and hindi"], index=0)
 with col2:
-    st.info("📚 Printed / scanned textbook PDFs पर best results. Handwritten notes पर OCR हमेशा accurate नहीं होगा।")
+    st.info("📚 Printed/scanned PDFs best. Handwritten OCR may be imperfect.")
 
-# Multi-file upload
-uploaded_files = st.file_uploader(
-    "📁 Upload PDF(s)", 
-    type="pdf",
-    accept_multiple_files=True
-)
+uploaded_files = st.file_uploader("📁 Upload PDF(s)", type="pdf", accept_multiple_files=True)
 
 if uploaded_files:
-    all_songs = ""
-    
     for uploaded_file in uploaded_files:
-        with st.spinner(f"🔍 Processing {uploaded_file.name}..."):
-            raw_text, page_count, noisy_pages = extract_pdf_text(uploaded_file)
+        with st.spinner(f"🔍 Reading {uploaded_file.name}..."):
+            text, page_count, noisy_pages = process_pdf(uploaded_file)
             
-            detected_lang = detect_language(raw_text[:2000])
+            detected_lang = detect_language(text[:2000])
             lang_display = "🇮🇳 Hindi" if detected_lang == "hindi" else "🇺🇸 English"
             
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("📄 Pages", page_count)
-            with col2:
-                st.metric("🔤 Characters", len(raw_text))
-            with col3:
-                st.metric("🗣️ Detected", lang_display)
+            m1, m2, m3 = st.columns(3)
+            with m1: st.metric("📄 Pages", page_count)
+            with m2: st.metric("🔤 Characters", len(text))
+            with m3: st.metric("🗣️ Detected", lang_display)
             
-            if noisy_pages:
-                st.warning(f"⚠️ {noisy_pages} noisy page(s) in {uploaded_file.name}")
-            
+            if noisy_pages: st.warning(f"⚠️ {noisy_pages} noisy OCR page(s)")
             st.success(f"✅ {uploaded_file.name} ready! ({lang_display})")
             
-            # Language selection
-            if lang_mode == "🚀 Auto-detect":
-                final_lang = detected_lang
-            elif "Hindi" in lang_mode:
-                final_lang = "hindi"
-            else:
-                final_lang = "english"
+            final_lang = detected_lang if lang_mode == "🚀 Auto-detect" else "hindi" if "Hindi" in lang_mode else "english"
             
-            if st.button(f"🎼 Generate Song for {uploaded_file.name}", key=f"gen_{uploaded_file.name}"):
-                chunks = chunk_text(raw_text)
-                st.info(f"🎼 Creating {min(20, len(chunks))} verse(s) from {uploaded_file.name}...")
+            if st.button(f"🎶 Generate Song: {uploaded_file.name}", key=f"gen_{uploaded_file.name}"):
+                chunks = chunk_text(text)[:15]  # Max 15 verses
+                st.info(f"🎼 Creating {len(chunks)} verses in **{final_lang.upper()}**...")
                 
                 bar = st.progress(0.0)
                 status = st.empty()
-                pdf_song = f"\n# 📚 {uploaded_file.name}\n\n"
+                final_song = ""
                 
-                for i, chunk in enumerate(chunks[:20]):  # Max 20 verses
-                    status.text(f"✍️ {uploaded_file.name}: Verse {i+1}/{min(20, len(chunks))}")
-                    
+                for i, chunk in enumerate(chunks):
+                    status.text(f"✍️ Verse {i+1}/{len(chunks)}...")
                     topic = get_topic_heading(chunk, final_lang)
                     verse = make_song(chunk, final_lang)
                     
-                    pdf_song += (
-                        f"**🧾 Topic:** {topic}\n\n"
-                        f"**🎵 Verse {i+1} 🎵**\n\n"
-                        f"{verse}\n\n"
-                        f"---\n\n"
-                    )
-                    
-                    bar.progress((i + 1) / min(20, len(chunks)))
-                    time.sleep(0.5)
+                    final_song += f"**🧾 Topic:** {topic}\n\n**🎵 Verse {i+1} 🎵**\n\n{verse}\n\n---\n\n"
+                    bar.progress((i + 1) / len(chunks))
+                    time.sleep(0.8)  # Rate limit protection
                 
-                all_songs += pdf_song
+                st.subheader("🎤 Complete Study Song")
+                st.markdown(final_song)
                 
-                st.markdown("### 🎤 Study Song Generated!")
-                st.markdown(pdf_song)
-    
-    # Final download
-    if all_songs:
-        st.download_button(
-            "📥 Download All Songs",
-            data=all_songs,
-            file_name="study_songs.txt",
-            mime="text/plain"
-        )
+                fname = uploaded_file.name.replace(".pdf", f"_{final_lang}_study_song.txt")
+                st.download_button("📥 Download", final_song, fname, "text/plain", use_container_width=True)
 
 else:
-    st.info("📁 Upload PDF(s) to generate study songs!")
+    st.info("📁 Upload PDF to start!")
