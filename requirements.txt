@@ -1,7 +1,8 @@
 streamlit
-groq
 pypdf
-pdf2image
+groq
 pytesseract
+pdf2image
+opencv-python-headless
 Pillow
-poppler-utils
+numpy
