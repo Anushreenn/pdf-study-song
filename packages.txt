@@ -1,7 +1,2 @@
-streamlit
-groq
-pypdf
-pdf2image
-pytesseract
-Pillow
+tesseract-ocr
 poppler-utils
