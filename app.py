@@ -20,6 +20,7 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 
 client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
 
+
 # Tesseract binary path (works on Colab / many Linux servers)
 pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
