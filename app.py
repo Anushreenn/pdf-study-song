@@ -1,5 +1,4 @@
 import streamlit as st
-import PyPDF2
 import fitz  # PyMuPDF
 from openai import OpenAI
 import time
@@ -45,7 +44,7 @@ def make_song_with_topic(chunk, lang="auto"):
     if not safe_chunk:
         safe_chunk = "Text is almost empty and noisy; use only these few visible words:\n" + chunk[:200]
 
-    if lang == "hindi":
+    if lang == "hindi" or lang == "hi":
         system_prompt = """तुम्हें नीचे दिए गए टेक्स्ट (chapter content) से ही
 एक छोटा, सरल और याद रखने लायक हिंदी स्टडी गीत बनाना है।
 
@@ -97,19 +96,16 @@ STRICT rules:
 
 # Extract text from PDF
 def extract_pdf_text(file):
+    file.seek(0)  # Ensure we're at start
     text = ""
     try:
-        # Try PyMuPDF first (better for scanned PDFs)
         doc = fitz.open(stream=file.read(), filetype="pdf")
         for page in doc:
             text += page.get_text()
         doc.close()
-    except:
-        # Fallback to PyPDF2
-        file.seek(0)
-        reader = PyPDF2.PdfReader(file)
-        for page in reader.pages:
-            text += page.extract_text() or ""
+    except Exception as e:
+        st.error(f"PDF reading warning (using fallback): {e}")
+        text = ""
     
     # Clean up extra whitespace
     text = re.sub(r'\n\s*\n', '\n\n', text)
@@ -138,9 +134,18 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file:
     with st.spinner("Reading PDF..."):
+        # Read file multiple times safely
+        uploaded_file.seek(0)
         raw_text = extract_pdf_text(uploaded_file)
-        page_count = len(fitz.open(stream=uploaded_file.read(), filetype="pdf"))
-        uploaded_file.seek(0)  # Reset for potential re-read
+        
+        # Reset for page count
+        uploaded_file.seek(0)
+        try:
+            doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+            page_count = len(doc)
+            doc.close()
+        except:
+            page_count = "Unknown"
         
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -148,7 +153,7 @@ if uploaded_file:
         with col2:
             st.metric("🔤 Characters", len(raw_text))
         with col3:
-            detected_lang = detect_language(raw_text[:1000])
+            detected_lang = detect_language(raw_text[:1000]) if raw_text else "en"
             st.metric("🗣️ Detected", "🇺🇸 English" if detected_lang == "en" else "🇮🇳 Hindi")
 
     if raw_text:
