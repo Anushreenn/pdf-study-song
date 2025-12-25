@@ -98,16 +98,19 @@ STRICT rules:
 - Output ONLY song lyrics, never explanations or meta-comments
 """
 
-    response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": safe_chunk}
-        ],
-        temperature=0.5,
-        max_tokens=450
-    )
-    return response.choices[0].message.content.strip()
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": safe_chunk}
+            ],
+            temperature=0.5,
+            max_tokens=450
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Error: Rate limit reached (try again later)"
 
 # ---------- YOUR EXACT PDF PROCESSING (Simplified - no OCR deps) ----------
 def extract_pdf_text(uploaded_file):
@@ -161,6 +164,8 @@ if uploaded_file is not None:
 
     st.success(f"✅ PDF ready! Detected: **{lang_display}**")
 
+    st.warning("⚠️ **Free limit: ~10 verses**. Upgrade Groq for unlimited!")
+
     if st.button("🎶 Generate Study Song", type="primary", use_container_width=True):
         if lang_mode == "🚀 Auto-detect":
             final_lang = detected_lang
@@ -169,7 +174,7 @@ if uploaded_file is not None:
         else:
             final_lang = "english"
 
-        chunks = chunk_text(text)
+        chunks = chunk_text(text)[:10]  # MAX 10 VERSES - RATE LIMIT SAFE
         st.info(f"🎼 Creating {len(chunks)} verse(s) in **{final_lang.upper()}** …")
 
         bar = st.progress(0.0)
@@ -179,8 +184,12 @@ if uploaded_file is not None:
         for i, chunk in enumerate(chunks):
             status.text(f"✍️ Generating verse {i+1}/{len(chunks)} …")
 
-            topic = get_topic_heading(chunk, final_lang)
-            verse = make_song(chunk, final_lang)
+            try:
+                topic = get_topic_heading(chunk, final_lang)
+                verse = make_song(chunk, final_lang)
+            except:
+                topic = "Rate Limited"
+                verse = "Skipped - daily limit reached"
 
             final_song += (
                 f"**🧾 Topic:** {topic}\n\n"
@@ -189,7 +198,7 @@ if uploaded_file is not None:
             )
 
             bar.progress((i + 1) / len(chunks))
-            time.sleep(0.3)  # Rate limit protection
+            time.sleep(0.8)  # RATE LIMIT PROTECTION
 
         st.subheader("🎤 Your Complete Study Song")
         st.markdown(final_song)
